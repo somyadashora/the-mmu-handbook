@@ -1,0 +1,85 @@
+---
+# ══════════════════════════════════════════════════════════════════════════════
+#  MMU Handbook — Pandoc/Eisvogel book metadata
+#  Used by build_pdf.sh when compiling the print PDF.
+# ══════════════════════════════════════════════════════════════════════════════
+
+# ── Title page ─────────────────────────────────────────────────────────────────
+title: "Memory Management Units and TLBs"
+subtitle: "Architecture, Implementation, and AI Workloads"
+author: ""
+date: "2025"
+
+titlepage: true
+titlepage-color: "1E2E42"          # deep navy — matches site hero
+titlepage-text-color: "E8F0F8"
+titlepage-rule-color: "4A7BAC"     # accent blue
+titlepage-rule-height: 2           # thinner rule (was 4)
+
+# ── Book layout ────────────────────────────────────────────────────────────────
+book: true                          # two-sided: alternating headers
+toc: true
+toc-depth: 2                        # chapters + first-level sections
+toc-own-page: true
+
+# ── Page geometry ──────────────────────────────────────────────────────────────
+papersize: a4
+fontsize: 10pt                      # compact (was 11pt)
+linestretch: 1.15                   # tight leading (Eisvogel default ~1.4)
+geometry: "top=20mm, bottom=22mm, left=25mm, right=20mm, bindingoffset=5mm"
+
+# ── Colour links ───────────────────────────────────────────────────────────────
+header-includes:
+  - |
+    \usepackage{xcolor}
+    \definecolor{mmulink}{HTML}{1E3A5A}
+    \definecolor{mmuurl}{HTML}{4A7BAC}
+    \definecolor{codebg}{HTML}{F5F7FA}
+    \definecolor{coderule}{HTML}{D0D7E3}
+  - |
+    \usepackage{microtype}
+  - |
+    \usepackage[export]{adjustbox}
+    \adjustboxset{max width=\linewidth, max height=0.82\textheight, keepaspectratio}
+  - |
+    \usepackage{listings}
+    \lstset{
+      basicstyle=\ttfamily\footnotesize,
+      breaklines=true,
+      breakatwhitespace=false,
+      breakautoindent=true,
+      breakindent=2em,
+      backgroundcolor=\color{codebg},
+      frame=leftline,
+      framesep=4pt,
+      framerule=1.5pt,
+      rulecolor=\color{coderule},
+      xleftmargin=8pt,
+      xrightmargin=0pt,
+      aboveskip=6pt,
+      belowskip=6pt,
+      keepspaces=true,
+      showstringspaces=false,
+      tabsize=4,
+      numbers=none
+    }
+  - |
+    \widowpenalty=10000
+    \clubpenalty=10000
+  - |
+    \usepackage{float}
+    \floatplacement{figure}{htbp}
+    \setlength{\floatsep}{8pt plus 2pt minus 2pt}
+    \setlength{\textfloatsep}{10pt plus 2pt minus 4pt}
+    \setlength{\intextsep}{8pt plus 2pt minus 2pt}
+  - |
+    \setlength{\parskip}{3pt plus 1pt}
+
+colorlinks: true
+linkcolor: mmulink
+urlcolor: mmuurl
+citecolor: mmulink
+
+# ── Disable code-listing line numbers (cleaner for short snippets) ─────────────
+listings-disable-line-numbers: true
+...
