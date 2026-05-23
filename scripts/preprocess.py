@@ -402,6 +402,186 @@ def process_md_chapter(ch_num: int) -> pathlib.Path:
     return out
 
 
+# ── Markdown post-processing (language tags + pseudo-code detection) ─────────
+
+# Language aliases produced by pandoc's HTML→Markdown converter.
+# These must be mapped to names that lstlisting recognises.
+_LANG_ALIASES: dict[str, str] = {
+    # Bare .sourceCode with no language → unlanguaged
+    'sourceCode': '',
+    # Map to exact lstlisting built-in names (case-sensitive)
+    'c':          'C',
+    'cpp':        'C++',
+    'c++':        'C++',
+    'python':     'Python',
+    'py':         'Python',
+    'bash':       'bash',
+    'sh':         'bash',
+    'shell':      'bash',
+    'java':       'Java',
+    'verilog':    'Verilog',
+    # Map to our custom lstdefinelanguage definitions
+    'asm':        'assembly',
+    'mips':       'assembly',
+    # Languages with no good listings equivalent → leave unlanguaged
+    'powershell': '',
+    'swift':      '',
+    'javascript': '',
+    'js':         '',
+}
+
+# Keywords that strongly suggest pseudo-code / algorithm prose.
+_PSEUDO_KW_RE = re.compile(
+    r'^\s*(?:'
+    r'(?:step|phase|case)\s+\d'        # "Step 1:", "Phase 2:"
+    r'|\d+\.\s+[A-Z]'                  # "1. Scan ..."  "3. If ..."
+    r'|if\s+\S.*(?:then|:)'            # "if condition then"
+    r'|(?:while|for|foreach|for each|repeat)\s'  # loops
+    r'|(?:return|output|yield)\s'      # return-like
+    r'|function\s+\w+\s*[:(]'         # function header
+    r'|procedure\s+\w+'               # procedure header
+    r'|algorithm\s+\w+'               # algorithm header
+    r')\b',
+    re.IGNORECASE | re.MULTILINE,
+)
+
+# Patterns that strongly indicate REAL code (not pseudo-code).
+_REAL_CODE_RE = re.compile(
+    r'(?:'
+    r'[^;]{5,};\s*$'              # lines ending in semicolon (C/Java/etc.)
+    r'|^\s*[{}]\s*$'             # bare { or } on its own line
+    r'|^\s*#\s*(?:include|define|ifdef|ifndef|endif|pragma)'  # C preprocessor
+    r'|^\s*(?:import|from\s+\S+\s+import)'   # Python/JS imports
+    r'|^\s*(?:def|class|async def)\s+\w+'    # Python definitions
+    r'|^\s*[$>#]\s'              # shell prompt ($, #, >)
+    r'|^\s*\w+\s*=\s*(?:function|class|new\s+\w+)'  # JS patterns
+    r')',
+    re.MULTILINE,
+)
+
+
+def _classify_block(content: str) -> str:
+    """
+    Return 'pseudocode', 'c', or '' (unlanguaged) based on block content.
+
+    Heuristic:
+    - If the content matches pseudo-code keywords AND has no real-code patterns
+      → 'pseudocode'
+    - If content looks like C (pointer ops, struct/typedef keywords) → 'c'
+    - Otherwise → '' (unlanguaged, but will still get lstset styling)
+    """
+    if _REAL_CODE_RE.search(content):
+        return ''           # real code: leave unlanguaged (no false highlights)
+
+    if _PSEUDO_KW_RE.search(content):
+        return 'pseudocode'
+
+    # ASCII-art diagrams or clock-style step descriptions:
+    # e.g. "Example: 8 pages in circular list", "[A=1][A=0]...", "^hand"
+    art_lines = sum(
+        1 for ln in content.splitlines()
+        if re.search(r'\[.*\]|^\s*\^|→|↑|↓|←|Step\s+\d', ln)
+    )
+    if art_lines >= 2:
+        return 'pseudocode'
+
+    return ''
+
+
+def _postprocess_md(md: str) -> str:
+    """
+    Post-process the pandoc HTML→Markdown output:
+
+    1.  Normalise ``{.sourceCode .LANG}`` fence tags → clean ``LANG`` names
+        that lstlisting recognises (e.g. ``{.sourceCode .c}`` → ``c``).
+
+    2.  Convert 4-space **indented** code blocks to fenced blocks so that
+        pandoc's ``--listings`` pipeline routes them through ``lstlisting``
+        (which applies our configured background / border styling).
+        Blocks that match pseudo-code heuristics are tagged ``pseudocode``;
+        others are left unlanguaged but still get the lstset styling.
+    """
+    # ── 1. Normalise {.sourceCode .LANG} fenced-block tags ────────────────────
+    def _clean_lang_tag(m: re.Match) -> str:
+        raw = m.group(1)          # e.g. ".sourceCode .c"
+        # Extract language classes (skip .sourceCode itself)
+        classes = [c.lstrip('.').lower() for c in raw.split() if c != '.sourceCode']
+        lang = _LANG_ALIASES.get(classes[0], classes[0]) if classes else ''
+        return f'```{lang}' if lang else '```'
+
+    md = re.sub(
+        r'```\s*\{([^}]+)\}',
+        _clean_lang_tag,
+        md,
+    )
+
+    # ── 2. Convert 4-space indented blocks → fenced pseudocode/plain ──────────
+    #
+    # An indented block in pandoc Markdown is one or more consecutive lines
+    # each starting with 4+ spaces (with blank lines allowed inside).
+    # We need to be outside a fenced block to process these.
+    out_lines: list[str] = []
+    in_fence  = False
+    fence_pat = re.compile(r'^`{3,}')
+
+    raw_lines = md.split('\n')
+    i = 0
+    while i < len(raw_lines):
+        line = raw_lines[i]
+
+        # Track fenced-block state
+        if fence_pat.match(line):
+            in_fence = not in_fence
+            out_lines.append(line)
+            i += 1
+            continue
+
+        if in_fence:
+            out_lines.append(line)
+            i += 1
+            continue
+
+        # Detect start of a 4-space indented block (outside any fence)
+        if re.match(r'^    \S', line):
+            # Collect all lines belonging to this indented block
+            block_lines: list[str] = []
+            j = i
+            while j < len(raw_lines):
+                ln = raw_lines[j]
+                if re.match(r'^    ', ln):            # indented line
+                    block_lines.append(ln[4:])         # strip 4-space prefix
+                    j += 1
+                elif ln.strip() == '':                 # blank line — may be inside block
+                    # Look ahead: if next non-blank line is still indented, keep it
+                    k = j + 1
+                    while k < len(raw_lines) and raw_lines[k].strip() == '':
+                        k += 1
+                    if k < len(raw_lines) and re.match(r'^    ', raw_lines[k]):
+                        block_lines.append('')         # preserve blank line
+                        j += 1
+                    else:
+                        break                          # end of indented block
+                else:
+                    break
+
+            content = '\n'.join(block_lines)
+            lang    = _classify_block(content)
+            fence   = f'```{lang}' if lang else '```'
+
+            out_lines.append(fence)
+            out_lines.extend(block_lines)
+            out_lines.append('```')
+            out_lines.append('')          # blank line after the fence
+
+            i = j
+            continue
+
+        out_lines.append(line)
+        i += 1
+
+    return '\n'.join(out_lines)
+
+
 # ── HTML chapter processing (primary source for all chapters) ────────────────
 
 def process_html_chapter(ch_num: int) -> pathlib.Path:
@@ -502,6 +682,7 @@ def process_html_chapter(ch_num: int) -> pathlib.Path:
     # Prepend the chapter H1 title (pandoc stripped the <header> above)
     md_text = f"# {title_text}\n\n" + md_text.lstrip()
     md_text = _replace_emoji(md_text)
+    md_text = _postprocess_md(md_text)
 
     out = CHAPTERS_OUT / f"chapter-{ch_num:02d}.md"
     out.write_text(md_text, encoding='utf-8')

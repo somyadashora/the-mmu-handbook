@@ -114,7 +114,7 @@ docker run --rm \
     --toc \
     --toc-depth=2 \
     --number-sections=false \
-    --syntax-highlighting=tango \
+    --syntax-highlighting=idiomatic \
     --resource-path=/scripts/build \
     --output=/output/mmu-handbook.pdf \
     2>&1 | grep -v '^$' | grep -v 'Missing character'   # suppress blank lines and font-missing noise
