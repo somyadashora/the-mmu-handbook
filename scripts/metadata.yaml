@@ -23,7 +23,7 @@ toc-own-page: true
 papersize: a4
 fontsize: 10pt
 linestretch: 1.15
-geometry: "top=20mm, bottom=22mm, left=25mm, right=20mm, bindingoffset=5mm"
+geometry: "top=20mm, bottom=22mm, left=13mm, right=10mm, bindingoffset=5mm"
 
 header-includes:
   - |

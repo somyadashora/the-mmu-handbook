@@ -70,6 +70,10 @@ CAPTION_RE = re.compile(
 )
 # Strips all HTML tags (used to clean caption text)
 TAG_RE = re.compile(r'<[^>]+>')
+# Strips a leading "Figure 1.1:" / "Fig. 3:" / "Figure 1:" label from captions.
+# Pandoc adds its own "Figure N:" counter, so the HTML label creates a double label.
+_FIG_LABEL_RE = re.compile(r'^Fig(?:ure)?\.?\s+[\d.]+[.:]?\s*', re.IGNORECASE)
+
 # Matches the pandoc ::: title-block-header div
 TITLE_BLOCK_RE = re.compile(
     r'^:{3,}\s*\{#title-block-header\}.*?:{3,}\s*\n?',
@@ -78,10 +82,12 @@ TITLE_BLOCK_RE = re.compile(
 # Matches a Part header at the H1 level (# Part I: …)
 PART_HDR_RE = re.compile(r'^# Part [IVX]+:.*\n?', re.MULTILINE)
 
-# ── Emoji → LaTeX symbol map ───────────────────────────────────────────────────
+# ── Emoji → LaTeX symbol maps ──────────────────────────────────────────────────
 # XeLaTeX's default font (Source Sans 3) lacks most emoji code points.
-# We replace common emoji with LaTeX-safe equivalents before compilation.
-_EMOJI_MAP: list[tuple[str, str]] = [
+# Two maps: prose gets LaTeX math; code blocks get ASCII digraphs so that
+# lstlisting verbatim environments don't contain unrenderable LaTeX commands.
+
+_EMOJI_PROSE_MAP: list[tuple[str, str]] = [
     # Unicode variation selectors (invisible; just remove them)
     ('︎', ''),
     ('️', ''),
@@ -93,21 +99,85 @@ _EMOJI_MAP: list[tuple[str, str]] = [
     # Warning / info
     ('⚠', '[!]'),                    # ⚠  warning sign
     ('ℹ', '[i]'),                    # ℹ  information source
-    # Arrows (often used in tables)
+    # Arrows (often used in prose and tables)
     ('→', r'$\rightarrow$'),         # →
     ('←', r'$\leftarrow$'),          # ←
     ('↔', r'$\leftrightarrow$'),     # ↔
     ('⇒', r'$\Rightarrow$'),         # ⇒
+    ('↓', r'$\downarrow$'),          # ↓
+    ('↑', r'$\uparrow$'),            # ↑
+    # Checkmark variants
+    ('✓', r'$\checkmark$'),          # ✓  light check mark (U+2713)
     # Bullets / symbols
     ('•', r'\textbullet{}'),         # •
     ('▶', r'$\blacktriangleright$'), # ▶
 ]
 
-def _replace_emoji(text: str) -> str:
-    """Replace emoji and unsupported Unicode with LaTeX-safe equivalents."""
-    for char, replacement in _EMOJI_MAP:
-        text = text.replace(char, replacement)
-    return text
+_EMOJI_CODE_MAP: list[tuple[str, str]] = [
+    # Unicode variation selectors (invisible; just remove them)
+    ('︎', ''),
+    ('️', ''),
+    # Checkmarks and crosses → ASCII
+    ('✅', '[OK]'), ('❌', '[X]'), ('✔', '[OK]'), ('✖', '[X]'),
+    # Warning / info
+    ('⚠', '[!]'), ('ℹ', '[i]'),
+    # Arrows → ASCII digraphs
+    ('→', '->'), ('←', '<-'), ('↔', '<->'), ('⇒', '=>'),
+    ('↓', '|'), ('↑', '^'),
+    # Checkmark variants
+    ('✓', '[OK]'),
+    # Bullets / symbols
+    ('•', '*'), ('▶', '>'),
+]
+
+
+def _replace_emoji_smart(md: str) -> str:
+    """
+    Replace emoji/symbols context-aware:
+      - Inside fenced code blocks (```...```) → ASCII digraphs (_EMOJI_CODE_MAP)
+      - Outside code blocks (prose, tables, headings) → LaTeX math (_EMOJI_PROSE_MAP)
+    """
+    parts: list[str] = []
+    _FENCE_LINE = re.compile(r'^(`{3,})[^\n]*', re.MULTILINE)
+    pos = 0
+    in_fence = False
+    fence_ticks = 0
+
+    for m in _FENCE_LINE.finditer(md):
+        ticks = len(m.group(1))
+        if not in_fence:
+            # Prose chunk before this opening fence
+            chunk = md[pos : m.start()]
+            for char, repl in _EMOJI_PROSE_MAP:
+                chunk = chunk.replace(char, repl)
+            parts.append(chunk)
+            parts.append(m.group(0))
+            pos = m.end()
+            in_fence = True
+            fence_ticks = ticks
+        else:
+            # Closing fence (must have at least as many ticks as the opener)
+            if ticks >= fence_ticks:
+                # Code chunk inside the fence
+                chunk = md[pos : m.start()]
+                for char, repl in _EMOJI_CODE_MAP:
+                    chunk = chunk.replace(char, repl)
+                parts.append(chunk)
+                parts.append(m.group(0))
+                pos = m.end()
+                in_fence = False
+                fence_ticks = 0
+
+    # Remaining text after the last fence line
+    chunk = md[pos:]
+    if in_fence:
+        for char, repl in _EMOJI_CODE_MAP:
+            chunk = chunk.replace(char, repl)
+    else:
+        for char, repl in _EMOJI_PROSE_MAP:
+            chunk = chunk.replace(char, repl)
+    parts.append(chunk)
+    return ''.join(parts)
 
 
 # ── Global figure counter (unique across all chapters) ─────────────────────────
@@ -125,8 +195,9 @@ def _strip_tags(html_text: str) -> str:
 
 
 def _clean_caption(raw: str) -> str:
-    """Strip HTML tags and normalise whitespace in a caption string."""
-    return ' '.join(_strip_tags(raw).split())
+    """Strip HTML tags, normalise whitespace, and remove leading figure-label prefix."""
+    text = ' '.join(_strip_tags(raw).split())
+    return _FIG_LABEL_RE.sub('', text)
 
 
 # ── SVG → PDF conversion ───────────────────────────────────────────────────────
@@ -395,7 +466,8 @@ def process_md_chapter(ch_num: int) -> pathlib.Path:
 
     text = _strip_md_toc(text)
     text = FIGURE_RE.sub(lambda m: _replace_figure_block(m.group(0), ch_num), text)
-    text = _replace_emoji(text)
+    text = _postprocess_md(text)
+    text = _replace_emoji_smart(text)
 
     out = CHAPTERS_OUT / f"chapter-{ch_num:02d}.md"
     out.write_text(text, encoding='utf-8')
@@ -492,6 +564,16 @@ def _postprocess_md(md: str) -> str:
     """
     Post-process the pandoc HTML→Markdown output:
 
+    0.  Convert ``::: {style="...font-family:monospace..."}`` fenced divs to
+        proper fenced code blocks so lstlisting renders them with monospace
+        styling.  Pandoc HTML→Markdown converts ``<div style="font-family:
+        monospace">`` to these `::: div` wrappers; pandoc's LaTeX backend
+        silently ignores the wrappers and outputs plain paragraphs.
+
+    0b. Strip remaining ``::: div`` wrapper lines (layout containers, table
+        scroll wrappers, info-boxes, etc.) that pandoc's LaTeX backend ignores.
+        Requires 3+ colons to avoid matching definition-list markers.
+
     1.  Normalise ``{.sourceCode .LANG}`` fence tags → clean ``LANG`` names
         that lstlisting recognises (e.g. ``{.sourceCode .c}`` → ``c``).
 
@@ -501,6 +583,29 @@ def _postprocess_md(md: str) -> str:
         Blocks that match pseudo-code heuristics are tagged ``pseudocode``;
         others are left unlanguaged but still get the lstset styling.
     """
+    # ── 0. Convert font-family:monospace div wrappers to fenced code blocks ────
+    def _mono_div_to_fence(m: re.Match) -> str:
+        content = m.group(1).strip()
+        # Unescape pandoc's backslash-escaped punctuation (e.g. "1\." → "1.",
+        # "\[Page Dir\]" → "[Page Dir]", "\<VA\>" → "<VA>")
+        content = re.sub(r'\\([^a-zA-Z0-9\n\r])', r'\1', content)
+        lang = _classify_block(content)
+        fence_open = f'```{lang}' if lang else '```'
+        return f'\n{fence_open}\n{content}\n```\n\n'
+
+    md = re.sub(
+        r'^:+ \{[^}]*font-family\s*:\s*monospace[^}]*\}\s*\n(.*?)^::+\s*$\n?',
+        _mono_div_to_fence,
+        md,
+        flags=re.MULTILINE | re.DOTALL,
+    )
+
+    # ── 0b. Strip remaining ::: div wrapper lines ──────────────────────────────
+    # These are layout containers (overflow-x:auto scroll wrappers, ::: container,
+    # ::: info-box, etc.) that pandoc's LaTeX backend ignores anyway.
+    # Requires 3+ colons to avoid matching definition-list syntax (":  def").
+    md = re.sub(r'^:{3,}[^\n]*$\n?', '', md, flags=re.MULTILINE)
+
     # ── 1. Normalise {.sourceCode .LANG} fenced-block tags ────────────────────
     def _clean_lang_tag(m: re.Match) -> str:
         raw = m.group(1)          # e.g. ".sourceCode .c"
@@ -635,7 +740,7 @@ def process_html_chapter(ch_num: int) -> pathlib.Path:
 
         figcap   = fig.find('figcaption')
         caption  = figcap.get_text(strip=True) if figcap else ''
-        caption  = ' '.join(caption.split())
+        caption  = _FIG_LABEL_RE.sub('', ' '.join(caption.split()))
 
         name     = _next_fig_name(ch_num)
         pdf_path = FIGURES_DIR / f"{name}.pdf"
@@ -681,8 +786,8 @@ def process_html_chapter(ch_num: int) -> pathlib.Path:
 
     # Prepend the chapter H1 title (pandoc stripped the <header> above)
     md_text = f"# {title_text}\n\n" + md_text.lstrip()
-    md_text = _replace_emoji(md_text)
-    md_text = _postprocess_md(md_text)
+    md_text = _postprocess_md(md_text)       # identify + fence code blocks first
+    md_text = _replace_emoji_smart(md_text)  # then apply context-aware symbol replacement
 
     out = CHAPTERS_OUT / f"chapter-{ch_num:02d}.md"
     out.write_text(md_text, encoding='utf-8')
