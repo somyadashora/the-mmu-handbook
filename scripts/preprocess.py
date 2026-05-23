@@ -147,6 +147,23 @@ def _sanitise_svg(svg: str) -> str:
         ``<text>`` element) cause a parse error in cairosvg.  We deduplicate
         by scanning every opening tag and keeping only the *last* occurrence
         of each attribute name, consistent with browser behaviour.
+
+    Fix 3 — undefined marker references:
+        If a path/line/polyline uses ``marker-end="url(#some-id)"`` but no
+        ``<marker id="some-id">`` is defined in the SVG, cairosvg crashes with
+        ``AttributeError: 'NoneType' object has no attribute 'get'``.  Browsers
+        handle this gracefully by simply not drawing the missing marker.  We
+        strip any marker-start/mid/end references whose target ID is not defined
+        within the SVG.
+
+    Fix 4 — unescaped XML special characters in text nodes:
+        SVGs authored for HTML may contain bare ``&`` (e.g. "TLB & PWC") or
+        ``<`` (e.g. "Miss rate: <0.1%") inside ``<text>`` / ``<tspan>``
+        elements.  These are tolerated by browsers but cause cairosvg's XML
+        parser to raise "not well-formed (invalid token)".  We locate the
+        *trailing* text node in each ``<text>``/``<tspan>`` element (the text
+        between the last ``>`` of any child element and the closing tag) and
+        escape ``&`` → ``&amp;`` and invalid ``<`` → ``&lt;``.
     """
     # ── Fix 1: add viewBox to root <svg> if missing ────────────────────────────
     def _ensure_viewbox(m: re.Match) -> str:
@@ -188,6 +205,67 @@ def _sanitise_svg(svg: str) -> str:
         svg,
         flags=re.IGNORECASE,
     )
+
+    # ── Fix 4: escape bare & and < in <text>/<tspan> text nodes ──────────────
+    def _fix_text_node(m: re.Match) -> str:
+        full = m.group(0)
+        tag  = m.group('tag')
+        close_tag = f'</{tag}>'
+        close_pos = full.rfind(close_tag)
+        if close_pos < 0:
+            return full
+        # The final text node is between the last '>' before the closing tag
+        # and the closing tag itself — everything after the last child element.
+        last_gt = full.rfind('>', 0, close_pos)
+        if last_gt < 0:
+            return full
+        text = full[last_gt + 1 : close_pos]
+        if not text:
+            return full
+        # Escape bare & (not already an entity reference &amp; &#123; etc.)
+        text = re.sub(
+            r'&(?![a-zA-Z][a-zA-Z0-9]*;|#[0-9]+;|#x[0-9a-fA-F]+;)',
+            '&amp;', text,
+        )
+        # Escape < not followed by a valid XML name-start char (so real tags survive)
+        text = re.sub(r'<(?![a-zA-Z_:/!?])', '&lt;', text)
+        return full[: last_gt + 1] + text + full[close_pos:]
+
+    svg = re.sub(
+        r'<(?P<tag>text|tspan)\b[^>]*>[\s\S]*?</(?P=tag)>',
+        _fix_text_node,
+        svg,
+        flags=re.IGNORECASE,
+    )
+
+    # ── Fix 3: strip marker-* references to undefined marker IDs ──────────────
+    # Collect all marker IDs defined in this SVG
+    defined_marker_ids: set[str] = set(
+        re.findall(r'<marker\b[^>]*\bid=["\']([^"\']+)["\']', svg, re.IGNORECASE)
+    )
+    if defined_marker_ids:
+        # Only strip markers if the SVG actually defines any; otherwise leave as-is
+        # (no markers defined + no references = nothing to do)
+        def _strip_undef_marker(m: re.Match) -> str:
+            url_id = re.search(r'url\(#([^)]+)\)', m.group(0))
+            if url_id and url_id.group(1) not in defined_marker_ids:
+                return ''   # remove the whole attribute
+            return m.group(0)
+
+        svg = re.sub(
+            r'\s+marker-(?:start|mid|end)=["\'][^"\']*["\']',
+            _strip_undef_marker,
+            svg,
+            flags=re.IGNORECASE,
+        )
+    else:
+        # No markers defined at all — strip ALL marker-* attributes to be safe
+        svg = re.sub(
+            r'\s+marker-(?:start|mid|end)=["\'][^"\']*["\']',
+            '',
+            svg,
+            flags=re.IGNORECASE,
+        )
 
     return svg
 
@@ -324,15 +402,33 @@ def process_md_chapter(ch_num: int) -> pathlib.Path:
     return out
 
 
-# ── HTML chapter processing (chapters without a Markdown source) ──────────────
+# ── HTML chapter processing (primary source for all chapters) ────────────────
 
 def process_html_chapter(ch_num: int) -> pathlib.Path:
     """
-    Extract and process a chapter from its HTML source.
-    Used for chapters 17–21 which have no Markdown source.
+    Extract and process a chapter from its deployed HTML source.
+    This is the primary pipeline for ALL chapters (1–21): the HTML files in
+    chapters/ are the authoritative, deployed versions — identical to the live
+    site — and are always preferred over the chapters-md/ Markdown sources,
+    which may be draft/incomplete (e.g. ch08 is missing sections 8.1–8.4 and
+    ch11 only has one section in its MD file).
     """
-    src  = HTML_SRC / f"chapter-{ch_num:02d}-WITH-FIGURES.html"
-    soup = BeautifulSoup(src.read_text(encoding='utf-8'), 'html.parser')
+    src      = HTML_SRC / f"chapter-{ch_num:02d}-WITH-FIGURES.html"
+    raw_html = src.read_text(encoding='utf-8')
+
+    # ── Pre-extract raw SVGs from original HTML BEFORE BeautifulSoup parsing ──
+    # html.parser lowercases ALL attribute names (viewBox → viewbox, markerWidth
+    # → markerwidth, etc.), which breaks cairosvg.  We extract the raw SVG text
+    # from the original file here, then use it for SVG→PDF conversion instead of
+    # the BeautifulSoup-mangled version.
+    # We only want SVGs that live inside <figure> elements.
+    raw_figure_svgs: list[str] = re.findall(
+        r'<figure[^>]*>.*?(<svg[\s\S]*?</svg>)[\s\S]*?</figure>',
+        raw_html,
+        re.IGNORECASE | re.DOTALL,
+    )
+
+    soup = BeautifulSoup(raw_html, 'html.parser')
 
     # ── Strip navigation / chrome ──────────────────────────────────────────────
     for el in soup.find_all(['script', 'style', 'link']):
@@ -350,6 +446,7 @@ def process_html_chapter(ch_num: int) -> pathlib.Path:
 
     # ── Replace SVG figures with <img> pointing at the converted PDF ───────────
     body = soup.find('body') or soup
+    _svg_raw_idx = 0   # index into raw_figure_svgs
     for fig in list(body.find_all('figure')):
         svg_tag = fig.find('svg')
         if not svg_tag:
@@ -363,7 +460,14 @@ def process_html_chapter(ch_num: int) -> pathlib.Path:
         name     = _next_fig_name(ch_num)
         pdf_path = FIGURES_DIR / f"{name}.pdf"
 
-        if not svg_to_pdf(str(svg_tag), pdf_path):
+        # Use original-case SVG if available; fall back to BeautifulSoup string
+        if _svg_raw_idx < len(raw_figure_svgs):
+            svg_src = raw_figure_svgs[_svg_raw_idx]
+        else:
+            svg_src = str(svg_tag)   # fallback (may have lowercased attrs)
+        _svg_raw_idx += 1
+
+        if not svg_to_pdf(svg_src, pdf_path):
             fig.decompose()
             continue
 
@@ -463,16 +567,18 @@ def main() -> None:
         md_src   = MD_SRC / f"chapter-{ch_num:02d}-WITH-FIGURES.md"
         html_src = HTML_SRC / f"chapter-{ch_num:02d}-WITH-FIGURES.html"
 
-        if md_src.exists():
-            print(f"  [md  ] Chapter {ch_num:02d} … ", end='', flush=True)
-            out = process_md_chapter(ch_num)
+        # HTML is the authoritative, deployed source — always prefer it.
+        # Fall back to MD only when no HTML file exists.
+        if html_src.exists():
+            print(f"  [html] Chapter {ch_num:02d} … ", end='', flush=True)
+            out = process_html_chapter(ch_num)
             size_kb = out.stat().st_size // 1024
             print(f"✓  {out.name}  ({size_kb} KB)")
             chapter_files.append(out)
 
-        elif html_src.exists():
-            print(f"  [html] Chapter {ch_num:02d} … ", end='', flush=True)
-            out = process_html_chapter(ch_num)
+        elif md_src.exists():
+            print(f"  [md  ] Chapter {ch_num:02d} … ", end='', flush=True)
+            out = process_md_chapter(ch_num)
             size_kb = out.stat().st_size // 1024
             print(f"✓  {out.name}  ({size_kb} KB)")
             chapter_files.append(out)
